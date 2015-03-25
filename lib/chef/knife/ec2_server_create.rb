@@ -209,6 +209,30 @@ class Chef
         :description => "The EC2 server attribute to use for SSH connection",
         :default => nil
 
+       option :associate_public_ip,
+         :long => "--associate-public-ip",
+         :description => "Associate public ip to VPC instance.",
+         :boolean => true,
+         :default => false
+
+       option :ebs_volume_type,
+         :long => "--ebs-volume-type TYPE",
+         :description => "Standard or Provisioned (io1) IOPS or General Purpose (gp2)",
+         :proc => Proc.new { |key| Chef::Config[:knife][:ebs_volume_type] = key },
+         :default => "standard"
+
+       option :ebs_provisioned_iops,
+         :long => "--provisioned-iops IOPS",
+         :description => "IOPS rate, only used when ebs volume type is 'io1'",
+         :proc => Proc.new { |key| Chef::Config[:knife][:provisioned_iops] = key },
+         :default => nil
+
+      option :additional_ebs_drives,
+        :long => "--additional-ebs-drives EBS_DRIVES",
+        :description => "Comma separated list of EBS drive mount points and sizes (e.g. /dev/sdj=50,/dev/sdk=100)",
+        :proc => lambda { |o| o.split(',').map { |d| { device: d.split('=').first, size: d.split('=').last } } },
+        :default => []
+
       def tcp_test_ssh(hostname, ssh_port)
         tcp_socket = TCPSocket.new(hostname, ssh_port)
         readable = IO.select([tcp_socket], nil, nil, 5)
@@ -290,6 +314,9 @@ class Chef
 
         if vpc_mode?
           msg_pair("Subnet ID", @server.subnet_id)
+          if config[:associate_public_ip]
+            msg_pair("Public DNS Name", @server.dns_name)
+          end
           if elastic_ip
             msg_pair("Public IP Address", @server.public_ip_address)
           end
@@ -410,6 +437,22 @@ class Chef
             exit 1
           end
         end
+
+        if config[:ebs_provisioned_iops] and config[:ebs_volume_type] != 'io1'
+          ui.error("--provisioned-iops option is only supported for volume type of 'io1'")
+          exit 1
+        end
+
+        if config[:ebs_volume_type] == 'io1' and config[:ebs_provisioned_iops].nil?
+          ui.error("--provisioned-iops option is required when using volume type of 'io1'")
+          exit 1
+        end
+
+        if config[:ebs_volume_type] and ! %w(gp2 io1 standard).include?(config[:ebs_volume_type])
+          ui.error("--ebs-volume-type must be 'standard' or 'io1' or 'gp2'")
+          msg opt_parser
+          exit 1
+        end
       end
 
       def tags
@@ -440,6 +483,7 @@ class Chef
         }
         server_def[:subnet_id] = locate_config_value(:subnet_id) if vpc_mode?
         server_def[:private_ip_address] = locate_config_value(:private_ip_address) if vpc_mode?
+        server_def[:associate_public_ip] = locate_config_value(:associate_public_ip) if vpc_mode? and config[:associate_public_ip]
 
         if Chef::Config[:knife][:aws_user_data]
           begin
@@ -473,17 +517,39 @@ class Chef
                         else
                           ami_map["deleteOnTermination"]
                         end
+           iops_rate = begin
+                         if config[:ebs_provisioned_iops]
+                           Integer(config[:ebs_provisioned_iops]).to_s
+                         else
+                           ami_map["iops"].to_s
+                         end
+                       rescue ArgumentError
+                         puts "--provisioned-iops must be an integer"
+                         msg opt_parser
+                         exit 1
+                       end
 
           server_def[:block_device_mapping] =
             [{
                'DeviceName' => ami_map["deviceName"],
                'Ebs.VolumeSize' => ebs_size,
-               'Ebs.DeleteOnTermination' => delete_term
+               'Ebs.DeleteOnTermination' => delete_term,
+               'Ebs.VolumeType' => config[:ebs_volume_type]
              }]
+            server_def[:block_device_mapping].first['Ebs.Iops'] = iops_rate unless iops_rate.empty?
         end
 
         (config[:ephemeral] || []).each_with_index do |device_name, i|
           server_def[:block_device_mapping] = (server_def[:block_device_mapping] || []) << {'VirtualName' => "ephemeral#{i}", 'DeviceName' => device_name}
+        end
+
+        (config[:additional_ebs_drives] || []).each_with_index do |device_info|
+          server_def[:block_device_mapping] = (server_def[:block_device_mapping] || []) << {
+            'DeviceName' => device_info[:device],
+            'Ebs.VolumeSize' => device_info[:size].to_s,
+            'Ebs.DeleteOnTermination' => config[:ebs_no_delete_on_term] ? 'false' : 'true',
+            'Ebs.VolumeType' => config[:ebs_volume_type]
+          }
         end
 
         server_def
@@ -528,7 +594,7 @@ class Chef
         @ssh_connect_host ||= if config[:server_connect_attribute]
           server.send(config[:server_connect_attribute])
         else
-          vpc_mode? ? server.private_ip_address : server.dns_name
+          vpc_mode? && !config[:associate_public_ip] ? server.private_ip_address : server.dns_name
         end
       end
 
