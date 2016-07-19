@@ -291,6 +291,12 @@ class Chef
         :proc => Proc.new { |key| Chef::Config[:knife][:provisioned_iops] = key },
         :default => nil
 
+      option :additional_ebs_drives,
+        :long => "--additional-ebs-drives EBS_DRIVES",
+        :description => "Comma separated list of EBS drive mount points and sizes (e.g. /dev/sdj=50,/dev/sdk=100)",
+        :proc => lambda { |o| o.split(',').map { |d| { device: d.split('=').first, size: d.split('=').last } } },
+        :default => []
+
       option :auth_timeout,
         :long => "--windows-auth-timeout MINUTES",
         :description => "The maximum time in minutes to wait to for authentication over the transport to the node to succeed. The default value is 25 minutes.",
@@ -931,6 +937,15 @@ class Chef
 
         (config[:ephemeral] || []).each_with_index do |device_name, i|
           server_def[:block_device_mapping] = (server_def[:block_device_mapping] || []) << {'VirtualName' => "ephemeral#{i}", 'DeviceName' => device_name}
+        end
+
+        (config[:additional_ebs_drives] || []).each_with_index do |device_info|
+          server_def[:block_device_mapping] = (server_def[:block_device_mapping] || []) << {
+            'DeviceName' => device_info[:device],
+            'Ebs.VolumeSize' => device_info[:size].to_s,
+            'Ebs.DeleteOnTermination' => config[:ebs_no_delete_on_term] ? 'false' : 'true',
+            'Ebs.VolumeType' => config[:ebs_volume_type]
+          }
         end
 
         server_def
